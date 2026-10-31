@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import binascii
 import os
 from dataclasses import dataclass
@@ -231,6 +232,7 @@ class QQBotWebhookAdapter(BaseAdapter[QQBotWebhookConfig]):
         self.logins: list[Login] = []
         self.bot_id_mapping: dict[str, str] = {}  # login.id -> bot app_id
         self.networks: dict[str, _QQNetwork] = {}
+        self._warmup_lock = asyncio.Lock()
         apply(self, self._get_network, self._get_login)
 
     def ensure_server(self, server: Server):
@@ -254,6 +256,8 @@ class QQBotWebhookAdapter(BaseAdapter[QQBotWebhookConfig]):
         return True
 
     async def get_logins(self) -> list[Login]:
+        if not self.logins and self.session:
+            await self._warmup_logins()
         for index, login in enumerate(self.logins):
             login.sn = index
         return self.logins
@@ -274,9 +278,24 @@ class QQBotWebhookAdapter(BaseAdapter[QQBotWebhookConfig]):
     def stages(self) -> set[Phase]:
         return {"preparing", "blocking", "cleanup"}
 
+    async def _warmup_logins(self):
+        """启动/首次获取登录信息时主动拉取一次，避免 Webhook 冷启动时 Satori 客户端拿不到账号。"""
+        async with self._warmup_lock:
+            if self.logins:
+                return
+            for app_id, secret in self.accesses.items():
+                if app_id not in self.networks:
+                    self.networks[app_id] = _QQNetwork(self, self.session, app_id, secret)
+                try:
+                    await asyncio.wait_for(self.refresh_login(app_id), timeout=15)
+                    logger.info(f"Login refreshed for app {app_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to refresh login for app {app_id}: {e!r}")
+
     async def launch(self, manager: Launart):
         async with self.stage("preparing"):
             self.session = aiohttp.ClientSession()
+            await self._warmup_logins()
 
         async with self.stage("blocking"):
             await manager.status.wait_for_sigexit()
